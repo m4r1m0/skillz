@@ -1,0 +1,499 @@
+---
+name: ootle-template-dev-reference
+description: Comprehensive reference for Tari Ootle template development — the rationale, failure modes, and worked examples behind the ootle-template-dev standards. Use when writing, editing, reviewing, or debugging Ootle templates and template clients, or when the concise standards skill leaves a "why" unanswered.
+---
+
+# Ootle Template Development — Comprehensive Reference
+
+> Source: lessons from the multi-round community review of the [confidential-rcv-template](https://github.com/m4r1m0/confidential-rcv-template) (reviewers: Kelketek and sdbondi), plus the Tari Ootle docs and guides. Each section explains the failure mode first, then the rule that prevents it. For the concise standards see the `ootle-template-dev` skill.
+
+## Table of Contents
+
+1. [Project Layout](#1-project-layout)
+2. [WASM Size and Publish Fees](#2-wasm-size-and-publish-fees)
+3. [Dependency Management](#3-dependency-management)
+4. [Fee Estimation in Client Code](#4-fee-estimation-in-client-code)
+5. [Template Design & Security](#5-template-design--security)
+6. [Determinism in Tally Logic](#6-determinism-in-tally-logic)
+7. [Testing Templates](#7-testing-templates)
+8. [Client-Side Transactions](#8-client-side-transactions)
+9. [Stealth Resources and Privacy](#9-stealth-resources-and-privacy)
+10. [Case Study: What the Review Caught](#10-case-study-what-the-review-caught)
+11. [Publishing and Template Metadata](#11-publishing-and-template-metadata)
+12. [Final Review Gate](#12-final-review-gate)
+
+---
+
+## 1. Project Layout
+
+A template project is a Rust workspace with three moving parts:
+
+```
+your-project/
+├── Cargo.toml            # workspace + [patch.crates-io] if needed
+├── tally/                # (optional) pure algorithm crate, no template ABI
+│   ├── Cargo.toml
+│   └── src/lib.rs
+├── templates/
+│   └── your_template/
+│       ├── Cargo.toml    # crate-type = ["cdylib"], release profile
+│       ├── src/lib.rs    # #[template] module
+│       └── tests/test.rs # in-process tooling tests
+└── client/
+    └── integration/      # (optional) testnet client, CI-only
+        ├── Cargo.toml
+        └── src/main.rs
+```
+
+### The template crate's Cargo.toml
+
+```toml
+[package]
+name = "your_template"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tari_template_lib = "0.31"          # use the current minor version from crates.io
+serde = "1"                         # only needed for structs outside the #[template] module
+
+[dev-dependencies]
+tari_template_test_tooling = "0.39" # use the current minor version from crates.io
+# Do NOT add tari_ootle_transaction separately: test tooling re-exports it
+# as tari_template_test_tooling::transaction
+
+[lib]
+crate-type = ["cdylib"]             # cdylib ONLY — see section 2
+
+[profile.release]
+opt-level = 's'     # Optimize for size.
+lto = true          # Enable Link Time Optimization.
+codegen-units = 1   # Reduce number of codegen units to increase optimizations.
+panic = 'abort'     # Abort on panic.
+strip = true        # Strip symbols and debug info.
+```
+
+> **Struct placement gotcha:** the `#[template]` macro treats the first struct in the template module as the component. Ancillary structs defined *inside* the template module must come **after** the component struct, or live in their own module and be `use`d. Ancillary structs defined *outside* the template module need `#[derive(serde::Serialize, serde::Deserialize)]` and `serde` as a dependency.
+
+---
+
+## 2. WASM Size and Publish Fees
+
+### The failure mode
+
+A naive template ships fat. In the RCV review, a 308 KB WASM cost **~7.8 million fee units (~5.8 TARI)** to publish — and the author's first attempt failed at 5 million. sdbondi's estimate: with proper configuration the same template should be ~250 KB and a fraction of the cost.
+
+Why so expensive: **every validator stores every published template forever.** Publishing is a permanent cost to every network participant, so the fee scales with size.
+
+### The rule set
+
+1. **`[profile.release]` exactly as above.** It is easy to omit or get wrong. sdbondi: "using tari-ootle-cli sets this up for you."
+
+2. **`crate-type = ["cdylib"]` only.** The RCV template originally shipped `["cdylib", "rlib"]` so its IRV module was unit-testable directly. Removing `rlib` dropped the WASM by ~76 KB — because **requesting both crate types makes rustc silently drop `-C lto`**, so `lto = true` never applied to the WASM. The fix that keeps testability: move pure logic into a standalone crate (see §6).
+
+3. **Minify with `wasm_opt` before publishing** (what `tari-ootle-cli` and walletd use):
+
+   ```bash
+   wasm-opt -Oz --enable-bulk-memory \
+     target/wasm32-unknown-unknown/release/your_template.wasm \
+     -o target/wasm32-unknown-unknown/release/your_template.min.wasm
+   ```
+
+   `--enable-bulk-memory` is required — rustc's wasm32 output uses bulk-memory ops, and without the flag wasm-opt refuses or produces broken output. Measured on the RCV template: 314 KB → 248 KB (−21%).
+
+4. **Check the size before publishing:**
+
+   ```bash
+   ls -la target/wasm32-unknown-unknown/release/*.wasm
+   ```
+
+5. **Scaffold with `tari-ootle-cli`** (`cargo install tari-ootle-cli`) — it sets up the profile, crate type, and minification automatically. It also has a `tari publish` workflow (see §11).
+
+6. **Fee units are sats-like integers, not TARI.** The web wallet represents fees the same way. A "10,000,000" publish fee is not 10M TARI — it's ~5.8 TARI in sats-equivalent units. Don't be scared of large integers; do be scared of large WASM.
+
+---
+
+## 3. Dependency Management
+
+### Never vendor upstream code
+
+The RCV template's first review round included a 78-file vendored copy of `ootle-rs` (with a signing fix). Kelketek's verdict: "These vendored items shouldn't be included except via crates... This prevents all of upstream's code from being committed to the repository, making review more laborious."
+
+**The accepted pattern for patching a crate you need fixed today:**
+
+1. Fork the crate's repo (`m4r1m0/tari-ootle`).
+2. Create a branch with the fix.
+3. Add the fork as a **git submodule** and override the dependency in the workspace `Cargo.toml`:
+
+   ```toml
+   [patch.crates-io]
+   ootle-rs = { path = "submodules/tari-ootle/crates/wallet/ootle-rs" }
+   # plus any of the fork's shared deps that need patching
+   ```
+
+4. Keep the consumer's `Cargo.toml` on the plain crates.io version (`ootle-rs = "0.16"`).
+5. **Open an upstream PR for the fix** (the RCV author opened tari-project/tari-ootle#2390).
+6. When upstream ships the fix, delete the submodule and the `[patch.crates-io]` section.
+
+### Other dependency rules
+
+- **No git dependencies.** All Tari crates are on crates.io; use minor-version pins (`"0.31"` not `"0.31.4"`).
+- **The Tari crates release as a set.** When the stack bumps, update together: `tari_template_lib`, `tari_template_lib_types`, `tari_ootle_transaction`, `tari_template_test_tooling`, `ootle-rs`, `ootle_byte_type`. The RCV template upgraded 0.29→0.31 / 0.38→0.39 with the template code unchanged — because its tally logic lived in a standalone crate insulated from ABI churn.
+- **Don't duplicate transitive deps:** `tari_template_test_tooling` re-exports `tari_ootle_transaction`; import it as `tari_template_test_tooling::transaction` instead of adding a second dev-dependency.
+
+---
+
+## 4. Fee Estimation in Client Code
+
+### The failure mode
+
+Hardcoded fees in the integration client were the other major round-1 finding. The author had set publish at 10,000,000 units ("nearly the actual cost", ~7.8M) and other calls at 50,000 units ("about 7x higher than was needed"). Kelketek: "It will definitely need to be removed for mainnet, and I believe there are functions for calculating the fees, as the CLI and wallet use them."
+
+### The accepted pattern: dry-run estimation
+
+```rust
+// build -> dry-run -> read estimated fee -> submit with margin
+const FEE_MARGIN_MULTIPLIER: u64 = 2;
+
+let unsigned = TransactionBuilder::new(provider.network())
+    .with_auto_fill_inputs()
+    .pay_fee_from_component(account_addr, 0u64)          // placeholder
+    .call_method(component_addr, "cast_ballot", args![...])
+    .build_unsigned();
+
+// 1. Dry-run to learn the true cost
+let dry_run = provider.dry_run(&unsigned).await?;
+let estimated = dry_run.fee_estimate();                  // exact API name varies by ootle-rs version
+
+// 2. Rebuild with the estimated fee (plus margin for estimation variance)
+let unsigned = TransactionBuilder::new(provider.network())
+    .with_auto_fill_inputs()
+    .pay_fee_from_component(account_addr, estimated * FEE_MARGIN_MULTIPLIER)
+    .call_method(component_addr, "cast_ballot", args![...])
+    .build_unsigned();
+
+let tx = TransactionRequest::default()
+    .with_transaction(unsigned)
+    .build(provider.wallet())
+    .await?;
+let receipt = provider.send_transaction(tx).await?.watch().await?;
+```
+
+The pattern applies everywhere: faucet claims, publish, method calls, private spends. The Wallet Web UI's "Estimate Fee" button does the same thing for manual publishing.
+
+---
+
+## 5. Template Design & Security
+
+### 5.1 Identity: always from the caller
+
+```rust
+let signer: RistrettoPublicKeyBytes = CallerContext::transaction_signer_public_key();
+```
+
+Never accept a public key (or account address) as a method argument and trust it as identity — anyone can pass anyone's key. The engine authenticates the signer; use it.
+
+One caveat discovered in the RCV review: **an identity-free method is required for stealth ballots.** `cast_ballot` deliberately calls no `CallerContext` function so the vote can be cast through an ephemeral one-time key. If your design needs stealth anonymity, don't call `transaction_signer_public_key()` in the ballot-casting path.
+
+### 5.2 Ownership semantics: the decorative-mint-rule bug
+
+The RCV template's ballot resource was declared:
+
+```rust
+ResourceBuilder::stealth()
+    .mintable(initiator_rule(), LOCKED)
+    ...
+```
+
+Kelketek asked: "If this resource is mintable by the initiator, wouldn't that mean that the initiator can mint more ballots as they please?" The author's analysis was worse than that: with the default `OwnerRule::OwnedBySigner`, **the owner of a resource is authorized for every resource action — including Mint — regardless of the `mintable` rule.** Anyone who called `new()` was owner, and could mint unlimited ballots. The mint rule was decorative.
+
+**The permanent-cap pattern:**
+
+1. `OwnerRule::None` on the resource (no owner).
+2. Mint rule = proof of a one-of NFT badge (`RVOTE-MINT`) created in the constructor and sealed in a vault that is *never* exposed.
+3. Lock the updaters (`rule!(deny_all)` with locked update rules) so the mint rule can never be relaxed.
+4. Verify supply stays capped: a test that attempts minting after the cap and expects failure.
+
+Note: the engine checks `BucketAction::CreateProof` against the vault's **Withdraw** access rule — the badge vault's withdraw rule must stay `allow_all` even though the vault is inert after construction, or `authorize()` on the badge will fail.
+
+### 5.3 Pin configuration at init — prevent result-shopping
+
+The template shipped six `end_vote*` variants (IRV, STV, expired variants). Kelketek: "Since the votes are public, someone could do the math offline, and then pick the result function based upon whichever gave them more favorable results. By declaring the method ahead of time, it prevents such chicanery."
+
+The fix: a `MultiWinnerMethod` enum pinned in the constructor, one `end_vote()` that dispatches:
+
+```rust
+pub enum MultiWinnerMethod { SequentialIrv, Stv }
+
+impl RankedVote {
+    pub fn new(method: MultiWinnerMethod, ...) -> Component<Self> {
+        Component::new(Self { method, ... }).with_access_rules(...).create()
+    }
+
+    pub fn end_vote(&mut self) -> Result {
+        match self.method {
+            MultiWinnerMethod::SequentialIrv => self.run_sequential_irv(),
+            MultiWinnerMethod::Stv => self.run_stv(),
+        }
+    }
+}
+```
+
+Constraint: the template macro's dispatcher cannot resolve module-internal types for function arguments — the enum must live at **crate root**, and its CBOR derives (via `minicbor`) must match `tari_template_lib`'s.
+
+### 5.4 The initiator is the caller of the constructor
+
+Round 1 shipped `INITIATOR_1` / `INITIATOR_2` placeholder public-key constants with a TODO. Kelketek: "I think it'd probably be best if the caller of `::new` be the initiator." The fix captures the signer in the constructor — no hardcoded keys, no arguments to spoof:
+
+```rust
+pub fn new(...) -> Component<Self> {
+    let initiator = CallerContext::transaction_signer_public_key();
+    ...
+}
+```
+
+### 5.5 Vaults are private substates
+
+Kelketek asked what "transactions cannot address vaults directly" meant. The transaction instruction set (`tari_ootle_transaction`'s `Instruction` enum: `CallFunction`, `CallMethod`, `StealthTransfer`, `TakeFromBucket`, ...) has **no vault-addressing instruction**. Vaults are reachable only from within the owning component's method code. Design APIs so clients interact with the component, not its vaults.
+
+### 5.6 Stealth ballots: minimum_value_promise
+
+With confidential amounts, an output-count/total-value check cannot distinguish "N ballots of 1" from "[2, 0]" — the amounts are Pedersen commitments. A 0-amount ballot would silently disenfranchise a voter.
+
+The engine's range-proof verification binds each committed output value to be at least its `minimum_value_promise`, and a 0-value output can only be proven with promise 0. Setting `minimum_value_promise >= 1` per ballot output makes `[2, 0]`-shaped statements **unconstructible**, not merely uncastable — the wallet cannot build them.
+
+### 5.7 Zero-turnout and edge semantics
+
+The review's sharpest catch (round 3): `test_no_ballots` asserted a winner with zero ballots. The tie-break ("eliminate lowest id") crowned the last remaining candidate in an election nobody voted in. Fixed: zero continuing ballots ⇒ `winner = None` in every tally.
+
+The same review exposed a latent STV bug: with zero continuing ballots, `floor(votes / (seats + 1))` computes to 0, and every candidate satisfies `count >= quota` — **all** active candidates get "elected". The correct Droop quota is `floor(votes / (seats + 1)) + 1`, which is ≥ 1 whenever any ballot continues.
+
+Define every degenerate path explicitly: no ballots, single candidate, all-eliminated, expired with no turnout, more winners than candidates.
+
+### 5.8 Features vs. one public template
+
+Round 2 advice was to use Cargo `features` so people could compile variants; round 3 reversed it: "While conditional compilation *is* the preferred way to handle 'everyone makes their own version', it's not the preferred way to handle 'publish a public template for anyone to use'... it just seems like more to maintain and a bit of a footgun in the collaboration process."
+
+Decision rule: features for private forks; a single well-vetted public template with configuration pinned at init for public deployment. Publishing is paid once per version — one good template beats several similar ones.
+
+---
+
+## 6. Determinism in Tally Logic
+
+On-chain tally code must be deterministic across validators:
+
+- **No floats.** Fixed-point arithmetic with an explicit scale (RCV's STV uses scale 10000).
+- **Deterministic tie-breaks:** lowest candidate id, lowest rank index — whatever it is, it must be total.
+- **No `rand` crate** (no entropy source on `wasm32-unknown-unknown`). `tari_template_lib::rand::random_bytes` is deterministic — entropy derives from the transaction itself so all validators agree.
+- **Sequential algorithms must map indices explicitly.** Sequential IRV reindexes candidates to `0..N` per seat and maps back to original ids at the end; don't rely on ordering side effects.
+
+### Keep pure logic in a standalone crate
+
+```toml
+# tally/Cargo.toml
+[package]
+name = "rcv-tally"
+version = "0.1.0"
+edition = "2024"
+# NO tari_template_lib dependency, NO cdylib — just pure Rust
+```
+
+The template crate depends on `rcv-tally` (path dependency); unit tests in `tally/tests/` test the algorithm directly; the template wraps results into ABI types. Benefits, both measured in the RCV review:
+
+- The template stays a **pure cdylib** (LTO applies, −76 KB).
+- The algorithm layer survives stack upgrades (0.29→0.31 with zero changes).
+
+---
+
+## 7. Testing Templates
+
+### In-process testing is the primary mechanism
+
+`tari_template_test_tooling` compiles your template to WASM and runs it against the real execution engine in-process. Kelketek's guidance: integration tests against testnet are "overkill for routine testing" — keep them, but label them CI-only; the standard test library handles everything in an orderly way.
+
+```rust
+use tari_template_test_tooling::TemplateTest;
+use tari_template_test_tooling::transaction::args;
+
+#[test]
+fn cast_and_tally() {
+    let mut test = TemplateTest::new(".", ["."]);
+    let (account, owner_proof, secret_key) = test.create_funded_account();
+    let template_addr = test.get_template_address("RankedVote");
+
+    let transaction = test.transaction()
+        .call_function(template_addr, "new", args![...])
+        .put_last_instruction_output_on_workspace("component")
+        .call_method("component", "cast_ballot", args![...])
+        .build_and_seal(&secret_key);
+
+    let result = test.execute_expect_success(transaction, vec![owner_proof]);
+}
+```
+
+### Adversarial tests are mandatory
+
+Kelketek's list (round 1): wrong token type, double-cast, cast after close, nonsense values (no candidates, no voters). The RCV template ended with: zero voter count, zero candidates, more winners than candidates, ballot after close, ballot after expiration, end-expired before deadline, wrong token while active, invalid rankings (out-of-range id, duplicated candidate, wrong length).
+
+```rust
+let tx = test.transaction()
+    .call_method(component_addr, "cast_ballot", args![wrong_bucket, ranking])
+    .build_and_seal(&secret_key);
+
+let result = test.execute_expect_failure(tx, vec![proof]);
+assert!(result.reject_reason.contains("Wrong resource type"));
+```
+
+### Time control
+
+Epoch-based rules (expiration) are testable with `set_virtual_substate`:
+
+```rust
+// advance the virtual epoch past expires_at_epoch
+test.set_virtual_substate(...); // see test tooling docs for the epoch accessor
+let tx = ...; // cast_ballot
+test.execute_expect_failure(tx, vec![proof]);
+```
+
+### The rollback property
+
+Failed transactions roll back completely — inputs (including stealth UTXOs) are returned. Adversarial tests can reuse the same UTXO across multiple failure attempts, which makes stealth-flavored adversarial tests cheap.
+
+### Known test-tooling limitations
+
+- The tooling hardcodes `minimum_value_promise = 0` for mint helpers; promise-aware mint tests must call `create_transfer_statement` directly.
+- The tooling's transaction builder (`builder_localnet`) passes `Epoch(100)` as `max_epoch` — fine for tests, but remember clients must do it themselves.
+
+---
+
+## 8. Client-Side Transactions
+
+### The sign → send → watch pattern
+
+```rust
+use tari_ootle_transaction::{TransactionBuilder, args};
+use ootle_rs::TransactionRequest;
+
+let unsigned = TransactionBuilder::new(provider.network())
+    .with_auto_fill_inputs()
+    .pay_fee_from_component(account_addr, estimated_fee)
+    .call_function(template_addr, "new", args![...])
+    .build_unsigned();
+
+let tx = TransactionRequest::default()
+    .with_transaction(unsigned)
+    .build(provider.wallet())
+    .await?;
+
+let pending = provider.send_transaction(tx).await?;
+let receipt = pending.watch().await?;
+```
+
+### `max_epoch` is mandatory
+
+The public Esmeralda indexer rejects transactions without a bounded validity window: *"Failed to decode transaction: unexpected type null ... expected u64"* (the `max_epoch` field). Fetch the current epoch from the indexer and add a margin:
+
+```rust
+fn max_epoch(provider: &Provider) -> u64 {
+    provider.get_epoch().await.unwrap().as_u64() + 10
+}
+```
+
+Apply it at **every** builder site.
+
+### Reading addresses from receipts
+
+```rust
+let component_addr = receipt.diff_summary.upped
+    .iter()
+    .find_map(|s| s.substate_id.as_component_address())
+    .expect("component address in receipt");
+
+let template_addr = receipt.diff_summary.upped
+    .iter()
+    .find_map(|s| s.substate_id.as_template())
+    .expect("template address in receipt");
+```
+
+Note: `as_template()` on `SubstateId` returns `Option<PublishedTemplateAddress>`; there is **no** `as_template_address()` on `SubstateId`.
+
+### Timeouts
+
+Default transaction timeout is 32 seconds — too short for Esmeralda. Use `connect_with_transaction_timeout(url, Duration::from_secs(120))`.
+
+### Structure clients as composable helpers
+
+Kelketek on a 346-line `main()`: "This function is positively massive... should be broken up so that we can compose the things it's doing down the line for different tests or as primitives for interacting with the contract in a real way." The accepted shape: one function per interaction primitive (`faucet`, `publish_template`, `create_vote_component`, `initiate_vote`, `cast_private_ballot`, `end_vote_and_read_result`), with `main()` as a thin orchestrator.
+
+---
+
+## 9. Stealth Resources and Privacy
+
+### The two-stealth-input signing bug
+
+Spending two stealth UTXOs in one transaction (RCV's ballot: ballot UTXO → `cast_ballot`, TARI UTXO → fee) failed with *"Invalid transaction signature"* on old `ootle-rs`. Root cause in `WalletStealthAuthorizer::create_authorizations`: the engine verifies authorization signatures against the **seal signature's one-time public key (P)**, but the wallet bound them to the **account key (K)**. Invisible with one stealth input; fatal with two. The fix derives P via `derive_stealth_owner_public_key(...)` and binds authorizations to it. (Upstreamed as tari-project/tari-ootle#2390; shipped in ootle-rs 0.18.)
+
+If you hit "Invalid transaction signature" with multi-stealth spends, check your ootle-rs version first.
+
+### Templates cannot enforce fee-from-stealth
+
+A stealth voter can destroy their own anonymity by paying the ballot's fee from a revealed account. Templates cannot prevent this: **they never see fee inputs** — fee payment is engine-handled and opaque to template code (`tari_template_lib` has no fee/introspection API). Mitigations:
+
+- Document fee-from-stealth as a hard client requirement (MUST), with the failure mode spelled out.
+- Provide a canonical reference implementation (`cast_private_ballot`) that does it right.
+- Contract-enforced fee-from-stealth is a possible future Ootle primitive — flag it as an improvement idea, don't claim it as a feature.
+
+### Residual privacy risks to document honestly
+
+- Timing analysis: with few voters, vote submissions are public events and timing may correlate ballots to voters. Grouping ballots into one bucket before broadcasting is a partial workaround.
+- Two ballots to one voter: a malicious actor controlling two addresses can cast twice. Not fully preventable without external identity.
+
+---
+
+## 10. Case Study: What the Review Caught
+
+Timeline of the confidential-rcv-template review (5 rounds, Jul 31 – Sep 2):
+
+| Round | Finding | Fix |
+|-------|---------|-----|
+| 1 | 78-file vendored `ootle-rs` | `[patch.crates-io]` + submodule + upstream PR; dropped when upstream shipped |
+| 1 | Hardcoded 10M publish fee (actual ~7.8M) | Size optimization + dry-run fee estimation |
+| 1 | Hardcoded 50K call fee (~7x too high) | Dry-run fee estimation with 2x margin |
+| 1 | Monolithic 346-line `main()` | Composable helper functions |
+| 1 | Single-winner only; council needs N seats | STV + sequential IRV, method pinned at init |
+| 1 | Happy-path tests only | 6+ adversarial tests with `execute_expect_failure` |
+| 1 | Separate `initiate_vote` transaction | Merged into constructor (saves ~30s + one fee) |
+| 2 | README falsely claimed it "extends" a sibling template | Removed stale claim |
+| 2 | Decorative mint rule + `OwnedBySigner` = unlimited minting | `OwnerRule::None` + sealed NFT badge + locked updaters |
+| 2 | Hardcoded initiator keys | Initiator = caller of `new()` |
+| 2 | Six `end_vote*` variants enable result-shopping | Enum pinned at init, single `end_vote()` dispatch |
+| 3 | Winner declared with zero ballots | `winner = None` on zero turnout (also fixed the Droop-quota-0 STV bug) |
+| 3 | Dual cdylib+rlib silently disables LTO | Pure `cdylib` + tally extracted to standalone crate (314→248 KB) |
+| 3 | Features-gated variants | Removed; one public template, config at init |
+| Final | fmt/clippy | `cargo fmt`, clippy clean before merge |
+
+---
+
+## 11. Publishing and Template Metadata
+
+- **Web UI is the easiest publish path** (Estimate Fee → Publish), and `tari-ootle-cli` has a `tari publish` command. Programmatic publish is fine in clients **only with dry-run fee estimation** — never hardcoded amounts.
+- **`tari publish` discovers `tari.config.toml` by walking up from the project dir.** Do not pass `-c tari.config.toml` — on `publish` that flag means `--custom-network`. Plain `tari publish` from the template directory is correct.
+- **Templates explorer metadata** so your template shows up with docs:
+
+  ```toml
+  [package.metadata.tari-template]
+  category = "governance"
+  tags = ["voting", "governance", "dao"]
+  docs = "https://..."
+  homepage = "https://..."
+  ```
+
+  A `build.rs` using `tari_ootle_template_build` extracts per-method rustdoc into `template_metadata.cbor`, whose hash is registered on-chain at publish. Orphaned empty doc-comment lines break the extraction — keep doc comments tidy.
+
+---
+
+## 12. Final Review Gate
+
+The last review round was: *"Have you run `cargo fmt` to format the code, and have you run clippy to make sure it's properly linted?"* — plus the checklist in the concise skill. CI automation of fmt/clippy is a recommended follow-up, not a blocker. Clippy nits that appeared in practice: `clone_on_copy` (x5), `identity_op`, `too_many_arguments`.
+
+Reviewers also read your README/docs against your code. Stale claims ("this extends X", fee numbers that no longer match, features that were removed) are review findings. Write docs for the code you actually have.
