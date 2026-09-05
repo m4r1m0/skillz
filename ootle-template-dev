@@ -36,7 +36,7 @@ description: Standards and lessons learned for Tari Ootle template development. 
 > Hardcoded fee amounts are the #1 client-side review finding. They are either 7x too high (wasted money) or too low (failed transactions).
 
 - **Never hardcode fees.** Estimate with a dry-run: build the transaction → dry-run it → read the estimated fee from the dry-run result → submit with a margin multiplier (2x) for estimation variance.
-- The template client (`client/integration/`) in confidential-rcv-template demonstrates the accepted pattern: `build -> dry-run -> read estimated fee -> submit`.
+- The accepted pattern is `build -> dry-run -> read estimated fee -> submit` (worked example in the reference skill).
 - Fee amounts are integer "sats-like" units, not TARI. Publish fees for a naive (unoptimized) template can run millions of units (~5.8 TARI for 300+ KB) — size optimization is what brings them down.
 - The Wallet Web UI has an "Estimate Fee" button — the easiest way to get an accurate publish estimate.
 
@@ -44,28 +44,28 @@ description: Standards and lessons learned for Tari Ootle template development. 
 
 - **Identity comes from the caller, never from arguments.** Use `CallerContext::transaction_signer_public_key()` for authentication. Accepting a public key as a method argument is spoofable.
 - **Ownership is a security boundary, not decoration.** With the default `OwnerRule::OwnedBySigner`, the owner is authorized for *any* resource action — including Mint — regardless of what your `mintable(...)` rule says. A decorative mint rule is not a cap. For permanent caps use `OwnerRule::None` + a mint rule that requires a proof of an NFT badge sealed in a component-internal vault, with locked updaters.
-- **Pin configuration at init as an enum, dispatch with one method.** If voters can choose between tally methods (e.g. IRV vs STV) at *call* time, anyone can compute all variants offline and call whichever gives the result they want. Declare the method in the constructor, expose a single `end_vote()` that `match`es on it.
-- **The initiator should be the caller of the constructor** — capture the signer in `new()` rather than hardcoding keys or accepting them as arguments.
+- **Pin configuration at init as an enum, dispatch with one method.** If users can choose between competing modes or algorithms at *call* time (e.g. which calculation method), anyone can compute all variants offline and call whichever gives the result they want. Declare the mode in the constructor and expose a single method that `match`es on it.
+- **Privileged roles come from the caller of the constructor** — capture the signer in `new()` rather than hardcoding keys or accepting them as arguments.
 - **Vaults are private substates.** The transaction instruction set has no vault-addressing instruction; vaults are reachable only from within their owning component's methods. Don't design APIs that assume clients can touch vaults directly.
-- **Stealth ballot outputs need `minimum_value_promise >= 1` per output.** With confidential amounts, output-count checks can't distinguish one-ballot-per-voter from a `[2, 0]` shape; a 0-value output can only be proven with promise 0, so promise-aware construction makes invalid shapes unconstructible rather than merely uncastable.
-- **Tally logic must be deterministic:** fixed-point arithmetic (e.g. scale 10000) instead of floats, ties broken by lowest candidate id. Randomness in templates is deterministic anyway — `tari_template_lib::rand::random_bytes`, never the `rand` crate.
-- **Define edge semantics explicitly.** Zero-turnout elections should elect nobody (`winner = None`), not crown an arbitrary candidate by elimination. Watch the off-by-one: with zero continuing ballots a Droop quota of `floor(votes / (seats + 1))` computes to 0 and *every* candidate is "elected" — the quota formula must be `floor(votes / (seats + 1)) + 1`.
+- **Stealth outputs need `minimum_value_promise >= 1` when every output must be non-zero** (e.g. distributing one token to each of N recipients). With confidential amounts, output-count checks can't distinguish the intended shape from a degenerate one (e.g. `[2, 0]`); a 0-value output can only be proven with promise 0, so promise-aware construction makes invalid shapes unconstructible rather than merely uncastable.
+- **On-chain computation must be deterministic:** fixed-point arithmetic (e.g. scale 10000) instead of floats, deterministic tie-breaks (lowest id/index). Randomness in templates is deterministic anyway — `tari_template_lib::rand::random_bytes`, never the `rand` crate.
+- **Define edge semantics explicitly.** Degenerate inputs must have defined, panic-free behavior — an empty state should yield "no result", not an arbitrary one produced by elimination-style loops. Watch for threshold formulas that degenerate at zero input: `floor(x / (n + 1))` computes to 0 when x is 0, so *everything* qualifies — the correct form is `floor(x / (n + 1)) + 1`.
 
 ## Testing
 
 > In-process tests with `tari_template_test_tooling` are the primary test mechanism. Testnet/mainnet integration tests are CI-only extras, not the routine workflow.
 
-- **Happy path is not enough.** Every template needs adversarial tests: wrong token type, double-cast, cast after close/expiration, nonsense inputs (zero voters, zero candidates, more winners than candidates, invalid rankings). Use `execute_expect_failure` + `assert_reject_reason`.
-- **Control time with `set_virtual_substate`** to test epoch-based rules (e.g. election expiration).
+- **Happy path is not enough.** Every template needs adversarial tests: wrong token type, double-submit/double-spend, use after close/expiration, and nonsense inputs (zero/empty arguments, out-of-range ids, duplicates, wrong-length collections). Use `execute_expect_failure` + `assert_reject_reason`.
+- **Control time with `set_virtual_substate`** to test epoch-based rules (deadlines, expirations).
 - **Failed transactions roll back completely** — spent UTXOs are returned. You can reuse the same inputs across adversarial attempts, which makes stealth-based adversarial tests cheap.
-- **Extract pure algorithms** (tallies, state machines) into a standalone crate with no template-ABI dependencies. They become directly unit-testable, and they survive template stack upgrades without changes.
+- **Extract pure algorithms** (computation-heavy logic, state machines) into a standalone crate with no template-ABI dependencies. They become directly unit-testable, and they survive template stack upgrades without changes.
 - Keep testnet integration tests minimal and labeled CI-only in comments.
 
 ## Client Apps
 
 - **Always set `max_epoch`** on transaction builders — the network rejects transactions without a bounded validity window. Fetch the current epoch from the indexer and add a margin.
-- **Two-stealth-input signing binds authorizations to the seal key, not the account key.** When a transaction spends two stealth UTXOs (e.g. a ballot UTXO + a TARI fee UTXO), authorization signatures must bind to the seal signature's one-time public key P (via `derive_stealth_owner_public_key`), not the account key K. Old `ootle-rs` had this bug — it was invisible with one stealth input and failed with "Invalid transaction signature" with two.
-- **Privacy is a property of the whole flow, and templates can't enforce all of it.** Templates never see fee inputs — a client can destroy stealth-voter anonymity by paying fees from a revealed account. Document the required client behavior (fee-from-stealth) as a hard requirement; consider making it unenforceable-on-chain explicit in the README.
+- **Two-stealth-input signing binds authorizations to the seal key, not the account key.** When a transaction spends two stealth UTXOs (e.g. spending a stealth asset while paying the fee from another stealth UTXO), authorization signatures must bind to the seal signature's one-time public key P (via `derive_stealth_owner_public_key`), not the account key K. Old `ootle-rs` had this bug — it was invisible with one stealth input and failed with "Invalid transaction signature" with two.
+- **Privacy is a property of the whole flow, and templates can't enforce all of it.** Templates never see fee inputs — a client can destroy stealth-recipient anonymity by paying fees from a revealed account. Document the required client behavior (fee-from-stealth) as a hard requirement; consider making it unenforceable-on-chain explicit in the README.
 - **Transaction timeout:** the default is 32 seconds, often too short for Esmeralda testnet. Use `connect_with_transaction_timeout(..., Duration::from_secs(120))`.
 
 ## Before Merge — Checklist
@@ -78,6 +78,6 @@ description: Standards and lessons learned for Tari Ootle template development. 
 - [ ] No vendored code; no git dependencies
 - [ ] Docs/README match the code — no stale claims (reviewers check this)
 - [ ] Access rules are real: no decorative mint rules, owner rules intentional
-- [ ] Edge semantics defined: zero-input, zero-ballot, expiration, double-spend paths
+- [ ] Edge semantics defined: zero-input, empty-state, expiration, double-spend paths
 - [ ] Adversarial tests exist for every public method's failure mode
 - [ ] Template metadata (`[package.metadata.tari-template]`) present for the templates explorer
